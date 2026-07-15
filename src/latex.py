@@ -1,11 +1,13 @@
-"""数式の切り出し画像を Groq のビジョンモデルで LaTeX に変換する。
+"""数式のレイアウトデータ（断片座標＋括線位置）から LaTeX を構造復元する。
 
-GROQ_API_KEY が未設定の場合は何もせず正常終了する（オプショナルな工程）。
-document.json の formula ブロックに latex フィールドを書き込む。
+画像 OCR は使わない。pdftohtml の出力に含まれる正確な座標情報と、
+背景 PNG から検出した括線・ルート棒の位置をテキストで Gemini に渡し、
+レイアウト構造から数式を組み立てさせる。
+（合成画像はフォント差でズレるため、人間の目視検証用にのみ使う）
 
-モデルは GROQ_MODEL で変更可能（デフォルト: Llama 4 Maverick）。
+GEMINI_API_KEY が未設定の場合は何もせず正常終了する（オプショナルな工程）。
+モデルは LATEX_MODEL で変更可能（デフォルト: gemini-2.5-flash）。
 """
-import base64
 import json
 import os
 import sys
@@ -14,48 +16,82 @@ from pathlib import Path
 
 import requests
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+DEFAULT_MODEL = "gemini-2.5-flash"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-PROMPT = """この画像は JIS 規格書から切り出した数式です。LaTeX に書き起こしてください。
+SYSTEM_PROMPT = """あなたはJIS規格書（機械・圧力容器分野）のPDFから抽出された数式レイアウトデータを
+LaTeXに復元する専門家です。
 
-- 数式本体のみを LaTeX で出力する（$ や \\[ \\] などの区切りは不要）
-- 変数の添字（下付き・上付き）を正確に再現する
-- 分数は \\frac、ルートは \\sqrt を使う
-- 数式として読み取れない場合は NOT_A_FORMULA とだけ出力する
-- 説明文は一切付けない"""
+入力データの説明:
+- テキスト断片: PDFから抽出した文字列と、その開始座標 (x=左端px, y=上端px)、フォントサイズ(px)
+  - y が小さいほど上。フォントサイズが小さい断片は添字（下付き/上付き）の可能性が高い
+  - 基準行より y が小さければ上付き・分子、大きければ下付き・分母の候補
+- 横線: 背景画像から検出した水平線。分数の括線またはルート記号の上棒
+  - sqrt=true はルート記号（左下に斜線を検出）、sqrt=false は分数の括線
+  - 線の上にある断片が分子（またはルートの中身）、下にある断片が分母
+
+添字の帰属規則（重要）:
+- フォントサイズが小さい断片は、x 座標が「すぐ左にある通常サイズの文字」に最も近い
+  変数の添字である。x 順で後続の記号（閉じ括弧など）より前に添字を付ける。
+  例: σ(x=403) y(x=415, size=8) )(x=421) → \\sigma_{y}) であって \\sigma)y ではない
+
+数字・記号断片の逆順補正（重要）:
+- PDF変換の癖で、数字や記号のみの断片は文字順が逆転していることがある
+  （例: 「3.0」は実際は「0.3」、「1(」は「(1」、「.0」は「0.」）
+- 逆転している断片とそうでない断片が混在するため、隣接する断片を連結したとき
+  工学式として自然な数値・構文になる読み方を選ぶこと
+  例: 「1(」「+」「.0」「004」→ 「(1 + 0.004」
+- 座屈・圧力容器の設計式では 0.3, 0.004, 1.5, 2/3 のような係数が典型的。
+  「3.0Et」のような不自然な係数は「0.3Et」の逆転を疑う
+- ギリシャ文字（σ, π等）はそのままLaTeXコマンドにする（\\sigma, \\pi）
+- 「≦」は \\le、「≧」は \\ge
+
+出力規則:
+- LaTeX数式本体のみを1行で出力する（$ や \\[ \\] などの区切り、説明文は一切不要）
+- 復元不能な場合は NOT_A_FORMULA とだけ出力する"""
 
 
-def transcribe(api_key: str, model: str, png_bytes: bytes) -> str:
-    data_url = "data:image/png;base64," + base64.standard_b64encode(png_bytes).decode()
+def build_user_prompt(layout: dict) -> str:
+    lines = ["テキスト断片:"]
+    for f in layout["fragments"]:
+        lines.append(f'  "{f["text"]}"  x={f["x"]} y={f["y"]} size={f["size"]}')
+    if layout.get("lines"):
+        lines.append("横線:")
+        for ln in layout["lines"]:
+            kind = "ルート上棒(sqrt=true)" if ln["sqrt"] else "分数の括線(sqrt=false)"
+            lines.append(f"  x={ln['x0']}..{ln['x1']} y={ln['y']}  {kind}")
+    else:
+        lines.append("横線: なし（分数・ルートを含まない式）")
+    lines.append("\nこのレイアウトをLaTeXに復元してください。")
+    return "\n".join(lines)
+
+
+def call_gemini(api_key: str, model: str, layout: dict) -> str:
     body = {
-        "model": model,
-        "max_completion_tokens": 1024,
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                    {"type": "text", "text": PROMPT},
-                ],
-            }
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": build_user_prompt(layout)}]}
         ],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 8192,
+        },
     }
-    for attempt in range(3):
+    for attempt in range(4):
         r = requests.post(
-            GROQ_URL,
+            GEMINI_URL.format(model=model),
             json=body,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={"x-goog-api-key": api_key},
             timeout=120,
         )
-        if r.status_code == 429:
-            wait = int(r.headers.get("retry-after", 2 ** (attempt + 1)))
-            time.sleep(wait)
+        if r.status_code in (429, 503):
+            time.sleep(2 ** (attempt + 2))
             continue
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-    raise RuntimeError("Groq API: リトライ上限に達しました (429)")
+        data = r.json()
+        parts = data["candidates"][0].get("content", {}).get("parts", [])
+        return "".join(p.get("text", "") for p in parts).strip()
+    raise RuntimeError("Gemini API: リトライ上限に達しました")
 
 
 def clean_latex(text: str) -> str:
@@ -69,12 +105,12 @@ def clean_latex(text: str) -> str:
 
 
 def main():
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("GROQ_API_KEY 未設定のため LaTeX 変換をスキップ", file=sys.stderr)
+        print("GEMINI_API_KEY 未設定のため LaTeX 変換をスキップ", file=sys.stderr)
         return
 
-    model = os.environ.get("GROQ_MODEL", DEFAULT_MODEL)
+    model = os.environ.get("LATEX_MODEL", DEFAULT_MODEL)
     out_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "out")
     doc_path = out_dir / "document.json"
     doc = json.loads(doc_path.read_text(encoding="utf-8"))
@@ -82,20 +118,17 @@ def main():
     converted = 0
     for page in doc["pages"]:
         for block in page["blocks"]:
-            if block["kind"] != "formula" or not block.get("image_path"):
-                continue
-            image_file = out_dir / "images" / block["image_path"]
-            if not image_file.exists():
+            if block["kind"] != "formula" or not block.get("layout"):
                 continue
             try:
-                text = clean_latex(transcribe(api_key, model, image_file.read_bytes()))
+                text = clean_latex(call_gemini(api_key, model, block["layout"]))
             except Exception as e:
-                print(f"p{page['page_no']} {block['image_path']}: エラー {e}", file=sys.stderr)
+                print(f"p{page['page_no']}: エラー {e}", file=sys.stderr)
                 continue
             if text and text != "NOT_A_FORMULA":
                 block["latex"] = text
                 converted += 1
-            print(f"p{page['page_no']} {block['image_path']}: {text[:60]}", file=sys.stderr)
+            print(f"p{page['page_no']}: {text[:80]}", file=sys.stderr)
 
     doc_path.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"LaTeX 変換: {converted} 件 (model: {model})")

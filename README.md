@@ -9,7 +9,7 @@ Supabase に格納して GitHub Pages のビューアで閲覧するプロトタ
 
 ```
 src/parse.py                 HTML → 構造化 JSON + 数式/ページ画像の切り出し
-src/latex.py                 数式画像 → LaTeX（Groq ビジョンモデル。API キーがあれば実行）
+src/latex.py                 数式レイアウト → LaTeX（Gemini による座標構造復元。API キーがあれば実行）
 src/load.py                  JSON + 画像 → Supabase（テーブル + Storage）
 supabase/schema.sql          テーブル定義（Supabase SQL Editor で実行）
 .github/workflows/parse.yml  手動実行ワークフロー
@@ -25,7 +25,7 @@ docs/                        GitHub Pages 用の静的ビューア
 - 数式は文字単位のバラバラな断片として配置されている
 
 パーサーは座標クラスタリングで数式領域を検出し、背景 PNG から矩形を切り出す。
-切り出した画像を Groq のビジョンモデルで LaTeX に変換し、テキスト・見出し・
+断片座標と括線位置を Gemini に渡して LaTeX を構造復元し、テキスト・見出し・
 キャプションとともに順序付きブロックとして DB に格納する。
 
 ## セットアップ
@@ -47,7 +47,7 @@ Settings → Secrets and variables → Actions に登録:
 |---|---|
 | `SUPABASE_URL` | Project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | DB / Storage への書き込み |
-| `GROQ_API_KEY` | （任意）数式の LaTeX 変換。未設定ならスキップ |
+| `GEMINI_API_KEY` | （任意）数式の LaTeX 変換。未設定ならスキップ |
 
 ### 3. GitHub Pages
 

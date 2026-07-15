@@ -138,6 +138,64 @@ def is_formula_fragment(text: str) -> bool:
     return True
 
 
+def detect_lines(bg_image, bbox, min_len=12):
+    """背景 PNG の切り出し範囲から横線（分数の括線・ルートの上棒）を検出する。
+
+    背景には図形しか描かれていないため、暗いピクセルの水平ランは
+    ほぼ確実に括線・ルート棒・罫線である。
+    左端の下に斜線（ルートのチェック記号）があれば sqrt と判定する。
+    """
+    x0, y0, _, _ = bbox
+    crop = bg_image.crop(bbox).convert("L")
+    w, h = crop.size
+    px = crop.load()
+
+    segments = []
+    for y in range(h):
+        run_start = None
+        for x in range(w + 1):
+            dark = x < w and px[x, y] < 128
+            if dark and run_start is None:
+                run_start = x
+            elif not dark and run_start is not None:
+                if x - run_start >= min_len:
+                    segments.append((run_start, x - 1, y))
+                run_start = None
+
+    # 太さのある線は複数行に検出されるのでマージ
+    merged = []
+    for sx, ex, sy in sorted(segments, key=lambda s: (s[2], s[0])):
+        for m in merged:
+            if abs(m["y"] - sy) <= 3 and not (ex < m["x0"] - 5 or sx > m["x1"] + 5):
+                m["x0"] = min(m["x0"], sx)
+                m["x1"] = max(m["x1"], ex)
+                break
+        else:
+            merged.append({"x0": sx, "x1": ex, "y": sy})
+
+    result = []
+    for m in merged:
+        # ルート判定: 線の左端の左下に図形ピクセル（ルートの斜線）があるか
+        sqrt = False
+        for dy in range(2, 16):
+            for dx in range(-12, 2):
+                xx, yy = m["x0"] + dx, m["y"] + dy
+                if 0 <= xx < w and 0 <= yy < h and px[xx, yy] < 128:
+                    sqrt = True
+                    break
+            if sqrt:
+                break
+        result.append(
+            {
+                "x0": m["x0"] + x0,
+                "x1": m["x1"] + x0,
+                "y": m["y"] + y0,
+                "sqrt": sqrt,
+            }
+        )
+    return result
+
+
 def render_formula_image(bg_image, items, bbox):
     """背景の切り出し（分数の横棒等の図形）にテキスト断片を座標どおり描画して合成する。
 
@@ -207,11 +265,13 @@ def parse_page(page_no, chunk, styles, base_url, out_dir, session):
             used.add(id(it))
         bbox = bbox_of(cluster)
         image_path = None
+        lines = []
         if bg_image:
             image_path = f"formulas/p{page_no:03d}_f{idx}.png"
             dest = out_dir / "images" / image_path
             dest.parent.mkdir(parents=True, exist_ok=True)
             render_formula_image(bg_image, cluster, bbox).save(dest)
+            lines = detect_lines(bg_image, bbox)
         raw_text = " ".join(
             it["text"] for it in sorted(cluster, key=lambda i: (i["top"], i["left"]))
         )
@@ -223,6 +283,18 @@ def parse_page(page_no, chunk, styles, base_url, out_dir, session):
                 "latex": None,
                 "bbox": bbox,
                 "image_path": image_path,
+                "layout": {
+                    "fragments": [
+                        {
+                            "text": it["text"],
+                            "x": it["left"],
+                            "y": it["top"],
+                            "size": it["size"],
+                        }
+                        for it in sorted(cluster, key=lambda i: (i["top"], i["left"]))
+                    ],
+                    "lines": lines,
+                },
             }
         )
 
