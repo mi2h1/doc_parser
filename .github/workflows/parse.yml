@@ -1,0 +1,47 @@
+name: Parse JIS document
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "対象ページの URL"
+        required: true
+        default: "https://kikakurui.com/b8/B8267-2020-01.html"
+      pages:
+        description: "対象ページ番号（例: 9-14 / 9,12,20-25）"
+        required: true
+        default: "9-14"
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Parse HTML
+        run: python src/parse.py --url "${{ inputs.url }}" --pages "${{ inputs.pages }}" --out out
+
+      - name: Convert formulas to LaTeX (optional)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python src/latex.py out
+
+      - name: Load into Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python src/load.py out
+
+      - name: Upload artifacts (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: parsed-output
+          path: out/
+          retention-days: 7
