@@ -80,7 +80,8 @@ def parse_pages_arg(spec: str):
 
 
 def clean_text(raw: str) -> str:
-    return htmllib.unescape(re.sub(r"<[^>]+>", "", raw)).strip()
+    text = htmllib.unescape(re.sub(r"<[^>]+>", "", raw))
+    return text.replace("\xa0", " ").strip()  # nbsp を通常スペースに正規化
 
 
 def is_header_footer(top: int, text: str) -> bool:
@@ -119,10 +120,11 @@ def trim_horizontal_outliers(items):
 
 
 def bbox_of(items):
-    x0 = min(it["left"] for it in items) - 6
-    y0 = min(it["top"] for it in items) - 8
-    x1 = max(it["left"] + int(len(it["text"]) * it["size"] * 0.7) for it in items) + 12
-    y1 = max(it["top"] + it["size"] for it in items) + 10
+    # ルート記号や大括弧などの図形は断片の座標より外側に伸びるため広めに取る
+    x0 = min(it["left"] for it in items) - 14
+    y0 = min(it["top"] for it in items) - 16
+    x1 = max(it["left"] + int(len(it["text"]) * it["size"] * 0.7) for it in items) + 24
+    y1 = max(it["top"] + it["size"] for it in items) + 26
     return [max(0, x0), max(0, y0), min(PAGE_W, x1), min(PAGE_H, y1)]
 
 
