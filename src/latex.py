@@ -15,7 +15,7 @@ from pathlib import Path
 import requests
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
+DEFAULT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 PROMPT = """この画像は JIS 規格書から切り出した数式です。LaTeX に書き起こしてください。
 

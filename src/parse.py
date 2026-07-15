@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 PAGE_W, PAGE_H = 892, 1263
 UA = {"User-Agent": "doc-parser-prototype/0.1 (internal QMS research)"}
@@ -36,6 +36,34 @@ FRAG_MAX_LEN = 4          # この文字数以下の断片は数式候補
 CLUSTER_V_GAP = 28        # 数式クラスタの縦方向許容ギャップ(px)
 CLUSTER_MIN_SIZE = 4      # 数式と見なす最小断片数
 LINE_TOL = 5              # 同一行と見なす top の許容差(px)
+RENDER_SCALE = 2          # 数式画像の拡大倍率（ビジョンモデルの読み取り精度向上）
+
+# 日本語を含む断片は数式ではなく本文の一部（「ここに，」等）
+RE_JP = re.compile(r"[぀-ヿ㐀-䶿一-鿿]")
+# 箇条書きマーカー（1)  a)  など）は数式断片から除外
+RE_LIST_MARKER = re.compile(r"^\d{1,2}\)$|^[a-zA-Z]\)$")
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+]
+_font_cache = {}
+
+
+def load_font(size: int):
+    if size in _font_cache:
+        return _font_cache[size]
+    font = None
+    for path in FONT_CANDIDATES:
+        try:
+            font = ImageFont.truetype(path, size)
+            break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default(size)
+    _font_cache[size] = font
+    return font
 
 
 def parse_pages_arg(spec: str):
@@ -98,6 +126,36 @@ def bbox_of(items):
     return [max(0, x0), max(0, y0), min(PAGE_W, x1), min(PAGE_H, y1)]
 
 
+def is_formula_fragment(text: str) -> bool:
+    if len(text) > FRAG_MAX_LEN:
+        return False
+    if RE_JP.search(text):
+        return False
+    if RE_LIST_MARKER.match(text):
+        return False
+    return True
+
+
+def render_formula_image(bg_image, items, bbox):
+    """背景の切り出し（分数の横棒等の図形）にテキスト断片を座標どおり描画して合成する。
+
+    背景 PNG には図形しか含まれず、文字は HTML テキスト層にしかないため、
+    両者を重ねて初めて完全な数式画像になる。
+    """
+    x0, y0, x1, y1 = bbox
+    s = RENDER_SCALE
+    canvas = bg_image.crop(bbox).resize(((x1 - x0) * s, (y1 - y0) * s), Image.LANCZOS)
+    draw = ImageDraw.Draw(canvas)
+    for it in items:
+        draw.text(
+            ((it["left"] - x0) * s, (it["top"] - y0) * s),
+            it["text"],
+            fill=(0, 0, 0),
+            font=load_font(it["size"] * s),
+        )
+    return canvas
+
+
 def classify_line(text: str) -> str:
     if RE_FIG_CAP.match(text):
         return "figure_caption"
@@ -136,7 +194,7 @@ def parse_page(page_no, chunk, styles, base_url, out_dir, session):
             {"top": top, "left": left, "size": int(styles.get(cls, 13)), "text": text}
         )
 
-    fragments = [it for it in items if len(it["text"]) <= FRAG_MAX_LEN]
+    fragments = [it for it in items if is_formula_fragment(it["text"])]
     formula_clusters = cluster_formulas(fragments)
 
     blocks = []
@@ -151,7 +209,7 @@ def parse_page(page_no, chunk, styles, base_url, out_dir, session):
             image_path = f"formulas/p{page_no:03d}_f{idx}.png"
             dest = out_dir / "images" / image_path
             dest.parent.mkdir(parents=True, exist_ok=True)
-            bg_image.crop(bbox).save(dest)
+            render_formula_image(bg_image, cluster, bbox).save(dest)
         raw_text = " ".join(
             it["text"] for it in sorted(cluster, key=lambda i: (i["top"], i["left"]))
         )
@@ -213,6 +271,7 @@ def main():
     print(f"fetch: {args.url}", file=sys.stderr)
     resp = session.get(args.url, headers=UA, timeout=120)
     resp.raise_for_status()
+    resp.encoding = "utf-8"  # HTTP ヘッダに charset がなく Latin-1 と誤判定されるため明示
     src = resp.text
 
     title_m = re.search(r"<title>(.*?)</title>", src)
