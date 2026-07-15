@@ -75,6 +75,13 @@ def call_gemini(api_key: str, model: str, layout: dict) -> str:
         "generationConfig": {
             "temperature": 0,
             "maxOutputTokens": 8192,
+            # 説明文の混入を防ぎ、LaTeX 本体だけを JSON で返させる
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {"latex": {"type": "STRING"}},
+                "required": ["latex"],
+            },
         },
     }
     for attempt in range(4):
@@ -90,7 +97,8 @@ def call_gemini(api_key: str, model: str, layout: dict) -> str:
         r.raise_for_status()
         data = r.json()
         parts = data["candidates"][0].get("content", {}).get("parts", [])
-        return "".join(p.get("text", "") for p in parts).strip()
+        text = "".join(p.get("text", "") for p in parts).strip()
+        return json.loads(text).get("latex", "").strip()
     raise RuntimeError("Gemini API: リトライ上限に達しました")
 
 

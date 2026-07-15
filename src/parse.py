@@ -138,15 +138,20 @@ def is_formula_fragment(text: str) -> bool:
     return True
 
 
-def detect_lines(bg_image, bbox, min_len=12):
+def detect_lines(bg_image, bbox, scale, min_len_css=12):
     """背景 PNG の切り出し範囲から横線（分数の括線・ルートの上棒）を検出する。
 
     背景には図形しか描かれていないため、暗いピクセルの水平ランは
     ほぼ確実に括線・ルート棒・罫線である。
     左端の下に斜線（ルートのチェック記号）があれば sqrt と判定する。
+
+    背景 PNG は HTML の表示サイズ（892x1263）より高解像度なため、
+    scale で PNG ピクセル座標へ変換して走査し、結果は CSS px に戻して返す。
     """
     x0, y0, _, _ = bbox
-    crop = bg_image.crop(bbox).convert("L")
+    pixel_bbox = [int(v * scale) for v in bbox]
+    min_len = int(min_len_css * scale)
+    crop = bg_image.crop(pixel_bbox).convert("L")
     w, h = crop.size
     px = crop.load()
 
@@ -177,34 +182,39 @@ def detect_lines(bg_image, bbox, min_len=12):
     for m in merged:
         # ルート判定: 線の左端の左下に図形ピクセル（ルートの斜線）があるか
         sqrt = False
-        for dy in range(2, 16):
-            for dx in range(-12, 2):
+        for dy in range(int(2 * scale), int(16 * scale)):
+            for dx in range(int(-12 * scale), int(2 * scale)):
                 xx, yy = m["x0"] + dx, m["y"] + dy
                 if 0 <= xx < w and 0 <= yy < h and px[xx, yy] < 128:
                     sqrt = True
                     break
             if sqrt:
                 break
+        # PNG ピクセル → CSS px に戻す
         result.append(
             {
-                "x0": m["x0"] + x0,
-                "x1": m["x1"] + x0,
-                "y": m["y"] + y0,
+                "x0": round(m["x0"] / scale) + x0,
+                "x1": round(m["x1"] / scale) + x0,
+                "y": round(m["y"] / scale) + y0,
                 "sqrt": sqrt,
             }
         )
     return result
 
 
-def render_formula_image(bg_image, items, bbox):
+def render_formula_image(bg_image, items, bbox, scale):
     """背景の切り出し（分数の横棒等の図形）にテキスト断片を座標どおり描画して合成する。
 
     背景 PNG には図形しか含まれず、文字は HTML テキスト層にしかないため、
     両者を重ねて初めて完全な数式画像になる。
+    背景 PNG は表示サイズより高解像度なため scale で換算して切り出す。
     """
     x0, y0, x1, y1 = bbox
     s = RENDER_SCALE
-    canvas = bg_image.crop(bbox).resize(((x1 - x0) * s, (y1 - y0) * s), Image.LANCZOS)
+    pixel_bbox = [int(v * scale) for v in bbox]
+    canvas = bg_image.crop(pixel_bbox).resize(
+        ((x1 - x0) * s, (y1 - y0) * s), Image.LANCZOS
+    )
     draw = ImageDraw.Draw(canvas)
     for it in items:
         draw.text(
@@ -267,11 +277,12 @@ def parse_page(page_no, chunk, styles, base_url, out_dir, session):
         image_path = None
         lines = []
         if bg_image:
+            scale = bg_image.width / PAGE_W
             image_path = f"formulas/p{page_no:03d}_f{idx}.png"
             dest = out_dir / "images" / image_path
             dest.parent.mkdir(parents=True, exist_ok=True)
-            render_formula_image(bg_image, cluster, bbox).save(dest)
-            lines = detect_lines(bg_image, bbox)
+            render_formula_image(bg_image, cluster, bbox, scale).save(dest)
+            lines = detect_lines(bg_image, bbox, scale)
         raw_text = " ".join(
             it["text"] for it in sorted(cluster, key=lambda i: (i["top"], i["left"]))
         )
